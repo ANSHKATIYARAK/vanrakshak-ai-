@@ -1,317 +1,302 @@
 import asyncio
-import random
 import time
-import math
-from datetime import datetime
+import json
+from datetime import datetime, timezone
+from sqlalchemy import desc
 from .database import SessionLocal
 from . import models
 
-def generate_stable_nodes():
-    nodes = {}
-    rng = random.Random(42)  # Fixed seed for stable demo coordinates
-    for i in range(1, 43):
-        node_id = f"VX-{str(i).zfill(2)}"
-        angle = i * (2 * 3.14159265 / 42)
-        # 3 concentric rings of nodes
-        ring = (i % 3) + 1
-        r = 0.0012 * ring + rng.uniform(-0.0002, 0.0002)
-        
-        # Centered around PR-04 biotope (24.123, 78.234)
-        lat = 24.123 + r * math.cos(angle)
-        lng = 78.234 + r * math.sin(angle)
-        
-        nodes[node_id] = {
-            "id": node_id,
-            "lat": round(lat, 6),
-            "lng": round(lng, 6),
-            "battery": rng.randint(88, 100),
-            "status": "active"
-        }
-    return nodes
-
 class EcoSimulator:
-    def __init__(self, manager):
+    def __init__(self, manager, diagnostics=None):
         self.manager = manager
-        
-        # Threat equation weights (Institutional Standard)
-        self.alpha = 0.4 # Acoustic
-        self.beta = 0.25 # Vibration
-        self.gamma = 0.25 # Eco silence
-        self.delta = 0.1 # Historical risk
-        
-        # State variables (normalized 0.0 - 1.0)
-        self.acoustic_anomaly = 0.02
-        self.vibration_anomaly = 0.01
-        self.ecological_silence = 0.05
-        self.historical_risk = 0.12
-        
-        self.threat_score = 0.0
-        self.prev_threat_score = 0.0
-        self.state = "STABLE"
-        
-        # Forest Integrity Variables (0-100)
-        self.biodiversity = 96.4
-        self.node_vitality = 99.8
-        self.eco_stability = 94.2
-        self.security_state = 100.0
-        
-        self.integrity_score = 98.0
-        
-        self.event_active = False
-        self.event_timer = 0
-        self.event_type = None # "ACOUSTIC_ENTROPY", "BSI_DEVIATION", etc.
-        
-        self.node_positions = generate_stable_nodes()
-        self.nodes = list(self.node_positions.keys())
-        self.telemetry_queue = []
-
-    def add_log(self, msg):
-        timestamp = datetime.now().strftime("[%H:%M:%S]")
-        self.telemetry_queue.append(f"{timestamp} {msg}")
-        if len(self.telemetry_queue) > 50:
-            self.telemetry_queue.pop(0)
-
-    def calculate_threat(self):
-        # Tn+1 = aA + bV + gE + dH
-        self.prev_threat_score = self.threat_score
-        self.threat_score = (self.alpha * self.acoustic_anomaly + 
-                             self.beta * self.vibration_anomaly + 
-                             self.gamma * self.ecological_silence + 
-                             self.delta * self.historical_risk)
-        
-        # Clamp and rounding for institutional precision
-        self.threat_score = round(max(0.0, min(1.0, self.threat_score)), 4)
-        
-        # Continuous State Logic
-        if self.threat_score < 0.20:
-            new_state = "STABLE"
-        elif self.threat_score < 0.45:
-            new_state = "ANALYSIS"
-        elif self.threat_score < 0.70:
-            new_state = "ESCALATED"
-        else:
-            new_state = "CRITICAL"
-            
-        if new_state != self.state:
-            prev_state = self.state
-            self.state = new_state
-            if new_state == "ANALYSIS":
-                self.add_log(f"System transitioning to ANALYSIS mode (T={self.threat_score})")
-            elif new_state == "ESCALATED":
-                self.add_log(f"ALERT: Significant ecological divergence in Sector D-4")
-            elif new_state == "CRITICAL":
-                self.add_log(f"CRITICAL: Biotope integrity failure imminent. TDOA localization locked.")
-            elif new_state == "STABLE" and prev_state != "STABLE":
-                self.add_log("System state restored to STABLE nominal parameters")
-
-    def calculate_integrity(self):
-        # F = 0.3B + 0.25N + 0.25E + 0.2S
-        self.security_state = round(max(0.0, 100.0 - (self.threat_score * 100)), 2)
-        f_score = (0.3 * self.biodiversity + 
-                   0.25 * self.node_vitality + 
-                   0.25 * self.eco_stability + 
-                   0.2 * self.security_state)
-        self.integrity_score = round(max(0.0, min(100.0, f_score)), 2)
-        return self.integrity_score
-
-    def generate_bsi_waveform(self):
-        # Bioacoustic Soundscape Index simulator
-        base = 0.8 - (self.ecological_silence * 0.6)
-        noise = random.uniform(-0.05, 0.05)
-        
-        if self.state == "CRITICAL":
-            # Flattened waveform with high-frequency spikes (mechanical interference)
-            spike = 0.9 if random.random() < 0.1 else 0.0
-            return (base * 0.3) + noise + spike
-        elif self.state == "ESCALATED":
-            # Significant drop in biophony
-            return (base * 0.6) + noise
-        else:
-            # Rich biophony
-            return base + noise
+        self.diagnostics = diagnostics or {
+            "last_bridge_heartbeat": 0.0,
+            "last_serial_read": 0.0,
+            "last_mqtt_received": 0.0,
+            "last_db_insert": 0.0,
+            "last_db_record_id": 0
+        }
+        self.node_id = "VR-X-001"
 
     async def run(self):
-        self.add_log("VanRakshak-X Operational Intelligence Online")
-        self.add_log("Environment: Tropical Semi-Deciduous (Sector PR-04)")
-        self.add_log("Mesh: 42 Nodes Synced (LoRa Tier-1 Topology)")
-        
+        print("[*] Telemetry Aggregator Core started.")
         while True:
-            # Probabilistic Environmental Escalation
-            if not self.event_active and random.random() < 0.03:
-                self.event_active = True
-                self.event_timer = random.randint(40, 80)
-                self.event_type = random.choice(["ACOUSTIC", "VIBRATION", "ECO_SILENCE"])
-                self.target_node = random.choice(self.nodes)
+            db = SessionLocal()
+            try:
+                # 1. Fetch recent telemetry records for VR-X-001
+                recent_tels = db.query(models.Telemetry).filter(
+                    models.Telemetry.node_id == self.node_id
+                ).order_by(desc(models.Telemetry.timestamp)).limit(2).all()
                 
-                # Update status of target and neighbors in simulator memory
-                self.node_positions[self.target_node]["status"] = "alert"
+                latest_tel = recent_tels[0] if len(recent_tels) > 0 else None
                 
-                # Sort nodes by distance to find neighbors
-                t_lat = self.node_positions[self.target_node]["lat"]
-                t_lng = self.node_positions[self.target_node]["lng"]
-                sorted_nodes = sorted(
-                    self.node_positions.values(),
-                    key=lambda n: (n["lat"] - t_lat)**2 + (n["lng"] - t_lng)**2
-                )
-                # Set nearest 2 neighbors to alert as well
-                self.alert_neighbors = [n["id"] for n in sorted_nodes[1:3]]
-                for n_id in self.alert_neighbors:
-                    self.node_positions[n_id]["status"] = "alert"
+                node = db.query(models.Node).filter(models.Node.id == self.node_id).first()
                 
-                if self.event_type == "ACOUSTIC":
-                    self.add_log(f"{self.target_node} detected anomalous acoustic entropy divergence")
-                elif self.event_type == "VIBRATION":
-                    self.add_log(f"Sub-canopy vibration threshold breach near {self.target_node}")
-                elif self.event_type == "ECO_SILENCE":
-                    self.add_log(f"BSI deviation threshold crossed: ecological silence detected in {self.target_node} radius")
+                # Check status and last seen
+                is_online = False
+                node_status = "offline"
+                last_seen_str = "Never"
                 
-                # Write alert to database
-                db = SessionLocal()
-                try:
-                    # Mark nodes as alert in DB
-                    for n_id in [self.target_node] + self.alert_neighbors:
-                        db_node = db.query(models.Node).filter(models.Node.id == n_id).first()
-                        if db_node:
-                            db_node.status = "alert"
+                # Default metrics
+                tilt = 0.0
+                accel_x = 0.0
+                accel_y = 0.0
+                accel_z = 9.81
+                vib = 0.0
+                rms = 0.0
+                peak = 0.0
+                rssi = -120
+                packets = 0
+                uptime = 0
+                who_am_i = 0
+                lora_ver = 0
+                raw_samples = [0, 0, 0, 0, 0]
+                mpu_s = "OFFLINE"
+                mic_s = "OFFLINE"
+                lora_s = "OFFLINE"
+                batt = 4.2
+                batt_pct = 100.0
+                
+                if latest_tel:
+                    # Calculate time delta in seconds
+                    now = datetime.now(timezone.utc)
+                    tel_time = latest_tel.timestamp.replace(tzinfo=timezone.utc)
+                    elapsed = (now - tel_time).total_seconds()
                     
-                    # Create Alert
-                    new_alert = models.Alert(
-                        node_id=self.target_node,
-                        threat_type=self.event_type.lower(),
-                        confidence=round(random.uniform(0.78, 0.96), 2),
-                        threat_score=round(self.threat_score, 4),
-                        resolved=False
-                    )
-                    db.add(new_alert)
-                    db.commit()
-                except Exception as e:
-                    print(f"Error seeding simulator alert to DB: {e}")
-                finally:
-                    db.close()
-
-            # Physics Update
-            if self.event_active:
-                self.event_timer -= 1
-                
-                # Gradual Escalation driven by event type
-                inc = random.uniform(0.005, 0.015)
-                if self.event_type == "ACOUSTIC":
-                    self.acoustic_anomaly = min(1.0, self.acoustic_anomaly + inc * 1.5)
-                    self.vibration_anomaly = min(1.0, self.vibration_anomaly + inc * 0.5)
-                elif self.event_type == "VIBRATION":
-                    self.vibration_anomaly = min(1.0, self.vibration_anomaly + inc * 1.5)
-                    self.historical_risk = min(1.0, self.historical_risk + inc * 0.2)
-                elif self.event_type == "ECO_SILENCE":
-                    self.ecological_silence = min(1.0, self.ecological_silence + inc * 2.0)
-                    self.biodiversity = max(40.0, self.biodiversity - inc * 10)
-                
-                self.eco_stability = max(30.0, self.eco_stability - inc * 5)
-                
-                # Slowly drain battery of alert nodes
-                for n_id in [self.target_node] + getattr(self, 'alert_neighbors', []):
-                    self.node_positions[n_id]["battery"] = max(0, self.node_positions[n_id]["battery"] - random.randint(1, 2))
-                
-                if self.event_timer <= 0:
-                    self.event_active = False
-                    
-                    # Reset simulator node status
-                    for n in self.node_positions.values():
-                        n["status"] = "active"
-                    
-                    self.add_log("TDOA triangulation protocol concluded. Dispatching Sentinel Drone.")
-                    
-                    # Resolve alert in database
-                    db = SessionLocal()
-                    try:
-                        # Reset node statuses in DB
-                        for n_id in [self.target_node] + getattr(self, 'alert_neighbors', []):
-                            db_node = db.query(models.Node).filter(models.Node.id == n_id).first()
-                            if db_node:
-                                db_node.status = "active"
+                    # ESP32 ONLINE: Telemetry received within 5 seconds
+                    if elapsed <= 5.0:
+                        is_online = True
+                        last_seen_str = f"{int(elapsed)} seconds ago" if elapsed >= 1.0 else f"{round(elapsed, 1)} sec ago"
+                        # Set actual metrics
+                        tilt = latest_tel.tilt or 0.0
+                        accel_x = latest_tel.accel_x or 0.0
+                        accel_y = latest_tel.accel_y or 0.0
+                        accel_z = latest_tel.accel_z or 9.81
+                        vib = latest_tel.vibration or 0.0
+                        rms = latest_tel.audio_rms or 0.0
+                        peak = latest_tel.audio_peak or 0.0
+                        rssi = latest_tel.rssi if latest_tel.rssi is not None else -120
+                        packets = latest_tel.packet_count or 0
+                        uptime = latest_tel.uptime or 0
+                        who_am_i = latest_tel.who_am_i or 0
+                        lora_ver = latest_tel.lora_ver or 0
+                        batt = latest_tel.battery_voltage or 0.0
                         
-                        # Resolve active alerts for the target node
-                        active_alerts = db.query(models.Alert).filter(
-                            models.Alert.node_id == self.target_node,
-                            models.Alert.resolved == False
-                        ).all()
-                        for alert in active_alerts:
-                            alert.resolved = True
-                        db.commit()
-                    except Exception as e:
-                        print(f"Error resolving simulator alerts in DB: {e}")
-                    finally:
-                        db.close()
-            else:
-                # Natural De-escalation (Entropic recovery)
-                dec = random.uniform(0.002, 0.008)
-                self.acoustic_anomaly = max(0.02, self.acoustic_anomaly - dec)
-                self.vibration_anomaly = max(0.01, self.vibration_anomaly - dec)
-                self.ecological_silence = max(0.05, self.ecological_silence - dec)
-                self.historical_risk = max(0.12, self.historical_risk - dec * 0.1)
+                        try:
+                            raw_samples = json.loads(latest_tel.raw_samples)
+                        except:
+                            raw_samples = [0, 0, 0, 0, 0]
+                            
+                        # Evaluate changes between consecutive samples
+                        mpu_changing = False
+                        mic_changing = False
+                        if len(recent_tels) >= 2:
+                            t1 = recent_tels[0]
+                            t2 = recent_tels[1]
+                            mpu_changing = (t1.tilt != t2.tilt) or (t1.accel_x != t2.accel_x) or (t1.accel_y != t2.accel_y)
+                            mic_changing = (t1.audio_rms != t2.audio_rms)
+                        else:
+                            # Default to True on single sample
+                            mpu_changing = True
+                            mic_changing = True
+
+                        # Apply sensor status rules:
+                        # MPU6050 ONLINE: WHO_AM_I valid AND telemetry changing
+                        who_am_i_valid = who_am_i in [0x68, 104, 0x69, 105, 0x70, 112]
+                        if who_am_i_valid and mpu_changing:
+                            mpu_s = "ONLINE"
+                        else:
+                            mpu_s = "OFFLINE"
+                        
+                        # INMP441 ONLINE: RMS values changing
+                        if mic_changing:
+                            mic_s = "ONLINE"
+                        else:
+                            mic_s = "OFFLINE"
+
+                        # LoRa ONLINE: Version register valid (SX127x is 0x12 = 18)
+                        if lora_ver == 18:
+                            lora_s = "ONLINE"
+                        else:
+                            lora_s = "OFFLINE"
+
+                        if mpu_s == "OFFLINE" or mic_s == "OFFLINE" or lora_s == "OFFLINE":
+                            node_status = "degraded"
+                        else:
+                            node_status = "active"
+                    else:
+                        is_online = False
+                        node_status = "offline"
+                        last_seen_str = f"{int(elapsed)} seconds ago" if elapsed >= 1.0 else f"{round(elapsed, 1)} sec ago"
                 
-                self.biodiversity = min(96.4, self.biodiversity + dec * 2)
-                self.eco_stability = min(94.2, self.eco_stability + dec * 3)
-
-            self.calculate_threat()
-            self.calculate_integrity()
-            
-            # Periodically write random telemetry to database (e.g. 8% chance per second)
-            if random.random() < 0.08:
-                telemetry_node = random.choice(self.nodes)
-                db = SessionLocal()
-                try:
-                    new_tel = models.Telemetry(
-                        node_id=telemetry_node,
-                        temperature=round(random.uniform(22.0, 31.0), 1),
-                        humidity=round(random.uniform(60.0, 95.0), 1),
-                        battery_voltage=round(random.uniform(3.6, 4.2), 2)
-                    )
-                    db.add(new_tel)
-                    
-                    # Sync battery level in DB
-                    db_node = db.query(models.Node).filter(models.Node.id == telemetry_node).first()
-                    if db_node:
-                        # Slightly drain battery on transmission
-                        self.node_positions[telemetry_node]["battery"] = max(0, self.node_positions[telemetry_node]["battery"] - random.choice([0, 1]))
-                        db_node.battery_level = self.node_positions[telemetry_node]["battery"]
+                # Update node status in DB
+                if node:
+                    node.status = node_status
+                    if is_online:
+                        node.battery_level = float(map_val(batt * 100, 330, 420, 0, 100))
                     db.commit()
-                except Exception as e:
-                    print(f"Error saving simulator telemetry to DB: {e}")
-                finally:
-                    db.close()
+                
+                # Check for "Node offline" alert
+                if not is_online and latest_tel:
+                    existing_offline = db.query(models.Alert).filter(
+                        models.Alert.node_id == self.node_id,
+                        models.Alert.threat_type == "Node offline",
+                        models.Alert.resolved == False
+                    ).first()
+                    if not existing_offline:
+                        offline_alert = models.Alert(
+                            node_id=self.node_id,
+                            threat_type="Node offline",
+                            confidence=0.99,
+                            threat_score=1.0,
+                            resolved=False
+                        )
+                        db.add(offline_alert)
+                        if node:
+                            node.status = "offline"
+                        db.commit()
+                elif is_online:
+                    active_offline = db.query(models.Alert).filter(
+                        models.Alert.node_id == self.node_id,
+                        models.Alert.threat_type == "Node offline",
+                        models.Alert.resolved == False
+                    ).first()
+                    if active_offline:
+                        active_offline.resolved = True
+                        db.commit()
 
-            # Intelligence Payload
-            payload = {
-                "type": "simulation_state",
-                "data": {
-                    "timestamp": time.time(),
-                    "state": self.state,
-                    "threat_score": self.threat_score,
-                    "integrity_score": self.integrity_score,
-                    "metrics": {
-                        "biodiversity": round(self.biodiversity, 2),
-                        "node_vitality": round(self.node_vitality, 2),
-                        "eco_stability": round(self.eco_stability, 2),
-                        "security_state": round(self.security_state, 2)
-                    },
-                    "telemetry": self.telemetry_queue[-10:],
-                    "bsi_index": round(self.generate_bsi_waveform(), 3),
-                    "mesh": {
-                        "active": len([n for n in self.node_positions.values() if n["battery"] > 0]),
-                        "latency": random.randint(18, 30) + int(self.threat_score * 40),
-                        "routing_efficiency": round(0.98 - (self.threat_score * 0.1), 3),
-                        "nodes": list(self.node_positions.values()) # Dynamic nodes list!
-                    },
-                    "localization": {
-                        "lat": 24.123 + (random.uniform(-0.005, 0.005) * self.threat_score),
-                        "lng": 78.234 + (random.uniform(-0.005, 0.005) * self.threat_score),
-                        "confidence": round(self.threat_score * 100, 1),
-                        "radius": max(5, 120 - int(self.threat_score * 110))
-                    } if self.threat_score > 0.2 else None
+                # 2. Forest Integrity Score Calculation
+                # Integrity Score = 100 - vibration_penalty - tilt_penalty - connectivity_penalty - battery_penalty
+                vib_penalty = min(30.0, vib * 0.4)
+                tilt_penalty = 30.0 if abs(tilt) > 5.0 else 0.0
+                conn_penalty = 50.0 if not is_online else 0.0
+                batt_penalty = min(30.0, max(0.0, (3.6 - batt) * 100.0))
+                
+                integrity_score = max(0.0, min(100.0, 100.0 - vib_penalty - tilt_penalty - conn_penalty - batt_penalty))
+                integrity_score = round(integrity_score, 1)
+                
+                # 3. Threat Level Determination
+                # Get active alerts
+                active_alerts = db.query(models.Alert).filter(
+                    models.Alert.node_id == self.node_id,
+                    models.Alert.resolved == False
+                ).all()
+                
+                alert_types = [a.threat_type for a in active_alerts]
+                
+                threat_level = "LOW"
+                if "Node offline" in alert_types:
+                    threat_level = "CRITICAL"
+                elif "Acoustic anomaly detected" in alert_types:
+                    if "Excessive vibration detected" in alert_types or "Tilt threshold exceeded" in alert_types:
+                        threat_level = "CRITICAL"
+                    else:
+                        threat_level = "HIGH"
+                elif "Excessive vibration detected" in alert_types or "Tilt threshold exceeded" in alert_types:
+                    threat_level = "MEDIUM"
+                elif "Battery critical" in alert_types:
+                    threat_level = "MEDIUM"
+                
+                threat_score_val = 0.1
+                if threat_level == "MEDIUM":
+                    threat_score_val = 0.45
+                elif threat_level == "HIGH":
+                    threat_score_val = 0.75
+                elif threat_level == "CRITICAL":
+                    threat_score_val = 1.0
+
+                # Assemble telemetry logs for verified alerts
+                telemetry_logs = []
+                recent_alerts_all = db.query(models.Alert).filter(
+                    models.Alert.node_id == self.node_id
+                ).order_by(desc(models.Alert.timestamp)).limit(10).all()
+                
+                for a in recent_alerts_all:
+                    time_str = a.timestamp.strftime("[%H:%M:%S]")
+                    status_text = "RESOLVED" if a.resolved else "ACTIVE"
+                    telemetry_logs.append(f"{time_str} {status_text}: {a.threat_type} (Conf: {int(a.confidence*100)}%)")
+                
+                if not telemetry_logs:
+                    telemetry_logs = ["[00:00:00] SYSTEM: VR-X-001 Online. Listening..."]
+
+                # 4. Construct aggregate state payload
+                payload = {
+                    "type": "simulation_state",
+                    "data": {
+                        "timestamp": time.time(),
+                        "state": threat_level,
+                        "threat_score": threat_score_val,
+                        "integrity_score": integrity_score,
+                        "diagnostics": self.diagnostics,
+                        "metrics": {
+                            "biodiversity": 96.4 if is_online else 0.0,
+                            "node_vitality": 100.0 if is_online else 0.0,
+                            "eco_stability": integrity_score,
+                            "security_state": 100.0 - (threat_score_val * 100.0)
+                        },
+                        "telemetry": telemetry_logs,
+                        "bsi_index": rms / 1000.0 if is_online else 0.0,
+                        "mesh": {
+                            "active": 1 if is_online else 0,
+                            "latency": 24 if is_online else 0,
+                            "routing_efficiency": 0.98 if is_online else 0.0,
+                            "nodes": [
+                                {
+                                    "id": self.node_id,
+                                    "lat": 24.123456,
+                                    "lng": 78.234567,
+                                    "battery": int(map_val(batt * 100, 330, 420, 0, 100)) if is_online else 0,
+                                    "battery_voltage": round(batt, 2),
+                                    "status": node_status,
+                                    "last_seen": last_seen_str,
+                                    "mpu_status": mpu_s,
+                                    "mic_status": mic_s,
+                                    "lora_status": lora_s,
+                                    "esp_status": "ONLINE" if is_online else "OFFLINE"
+                                }
+                            ]
+                        },
+                        "latest_telemetry": {
+                            "db_id": latest_tel.id,
+                            "nodeId": self.node_id,
+                            "tilt": round(tilt, 2),
+                            "accel_x": round(accel_x, 3),
+                            "accel_y": round(accel_y, 3),
+                            "accel_z": round(accel_z, 3),
+                            "vibration": round(vib, 1),
+                            "audioRms": round(rms, 1),
+                            "audioPeak": round(peak, 1),
+                            "battery": round(batt, 2),
+                            "rssi": rssi,
+                            "packets": packets,
+                            "uptime": uptime,
+                            "who_am_i": hex(who_am_i) if who_am_i else "0x00",
+                            "lora_ver": hex(lora_ver) if lora_ver else "0x00",
+                            "raw_samples": raw_samples,
+                            "timestamp": datetime.now().isoformat() + "Z"
+                        } if latest_tel else None,
+                        "alerts": [
+                            {
+                                "id": a.id,
+                                "type": a.threat_type,
+                                "conf": a.confidence,
+                                "score": a.threat_score,
+                                "timestamp": a.timestamp.isoformat()
+                            } for a in active_alerts
+                        ]
+                    }
                 }
-            }
-            
-            await self.manager.broadcast(payload)
+                
+                # Broadcast payload
+                await self.manager.broadcast(payload)
+                
+            except Exception as e:
+                print(f"[!] Error in aggregator core loop: {e}")
+            finally:
+                db.close()
+                
             await asyncio.sleep(1.0)
 
-
+def map_val(val, in_min, in_max, out_min, out_max):
+    result = (val - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+    return max(out_min, min(out_max, result))

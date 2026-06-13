@@ -1,3 +1,6 @@
+#define DIAGNOSTIC_MODE false
+#define DEMO_MODE true
+
 #include <Arduino.h>
 #include <LoRa.h>
 #include <Adafruit_MPU6050.h>
@@ -7,6 +10,11 @@
 #include <driver/i2s.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <SPI.h>
+
+// Forward declarations of direct sensor register readers
+byte readRegisterSPI(byte address);
+byte readMpuWhoAmI(byte addr);
 
 // WiFi & MQTT Credentials
 const char* ssid = "irladitya";
@@ -48,6 +56,16 @@ PubSubClient mqttClient(espClient);
 const char* NODE_ID = "VR-X-001";
 float backgroundNoiseFloor = 20.0; // Startup baseline noise floor
 float currentTilt = 0.0;
+
+// Global tracking variables for real-time telemetry
+float lastAccelX = 0.0;
+float lastAccelY = 0.0;
+float lastAccelZ = 0.0;
+float lastVibrationScore = 0.0;
+float lastAudioRMS = 0.0;
+float lastAudioPeak = 0.0;
+int32_t lastRawSamples[5] = {0, 0, 0, 0, 0};
+int loraPacketCount = 0;
 
 // Hardware Status Flags
 bool loraEnabled = false;
@@ -138,7 +156,511 @@ void sendAlert(float score, const char* type);
 void sendTelemetry();
 void updateLEDs(bool alertActive);
 
+#if DIAGNOSTIC_MODE
+
+#include <SPI.h>
+
+// Forward declarations for functions defined later in main.cpp
+bool tryI2SPins(int sckPin, int sdPin);
+bool readRawAcceleration(int16_t &ax, int16_t &ay, int16_t &az);
+
+int activeSckPin = 33;
+int activeSdPin = 32;
+i2s_channel_fmt_t activeChannelFmt = I2S_CHANNEL_FMT_ONLY_LEFT;
+const char* activeMicConfigName = "Config A (SCK=33, SD=32, Left Only)";
+
+// Helper function to read SX1278 register directly via SPI
+byte readRegisterSPI(byte address) {
+    SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(LORA_SS, LOW);
+    SPI.transfer(address & 0x7F);
+    byte value = SPI.transfer(0x00);
+    digitalWrite(LORA_SS, HIGH);
+    SPI.endTransaction();
+    return value;
+}
+
+// Helper function to read MPU WHO_AM_I register directly via I2C
+byte readMpuWhoAmI(byte addr) {
+    byte chipID = 0;
+    Wire.beginTransmission(addr);
+    Wire.write(0x75);
+    if (Wire.endTransmission(false) == 0) {
+        Wire.requestFrom(addr, (uint8_t)1);
+        if (Wire.available()) {
+            chipID = Wire.read();
+        }
+    }
+    return chipID;
+}
+
+// Stats sweep function for microphone
+bool runI2SStatisticalTest(int sckPin, int sdPin, i2s_channel_fmt_t channelFmt, const char* name) {
+    Serial.printf("\n--- Testing I2S Permutation: %s (SCK=%d, SD=%d) ---\n", name, sckPin, sdPin);
+    
+    // Uninstall to ensure clean state
+    i2s_driver_uninstall(I2S_NUM_0);
+
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = channelFmt,
+#ifdef I2S_COMM_FORMAT_STAND_I2S
+        .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_I2S,
+#else
+        .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S_MSB | I2S_COMM_FORMAT_I2S),
+#endif
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 64,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+    };
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = sckPin,
+        .ws_io_num = I2S_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = sdPin
+    };
+
+    if (i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL) != ESP_OK) {
+        Serial.println("Result: I2S Driver Install Failed");
+        return false;
+    }
+
+    if (i2s_set_pin(I2S_NUM_0, &pin_config) != ESP_OK) {
+        Serial.println("Result: I2S Set Pin Failed");
+        i2s_driver_uninstall(I2S_NUM_0);
+        return false;
+    }
+
+    // Give clock settlement time
+    delay(200);
+
+    // Read 100 samples
+    int32_t samples[100];
+    size_t bytesRead = 0;
+    esp_err_t err = i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, pdMS_TO_TICKS(100));
+
+    if (err != ESP_OK || bytesRead == 0) {
+        Serial.println("Result: Read Failed (Timeout or Error)");
+        i2s_driver_uninstall(I2S_NUM_0);
+        return false;
+    }
+
+    int sampleCount = bytesRead / sizeof(int32_t);
+    if (sampleCount == 0) {
+        Serial.println("Result: No samples read");
+        i2s_driver_uninstall(I2S_NUM_0);
+        return false;
+    }
+
+    // Calculate stats
+    int32_t minVal = samples[0];
+    int32_t maxVal = samples[0];
+    double sum = 0;
+    for (int i = 0; i < sampleCount; i++) {
+        int32_t val = samples[i];
+        if (val < minVal) minVal = val;
+        if (val > maxVal) maxVal = val;
+        sum += (double)val;
+    }
+    double mean = sum / sampleCount;
+
+    double sqDiffSum = 0;
+    for (int i = 0; i < sampleCount; i++) {
+        double diff = (double)samples[i] - mean;
+        sqDiffSum += (diff * diff);
+    }
+    double variance = sqDiffSum / sampleCount;
+
+    // Count unique values
+    int uniqueCount = 0;
+    int32_t uniqueValues[100];
+    for (int i = 0; i < sampleCount; i++) {
+        bool found = false;
+        for (int j = 0; j < uniqueCount; j++) {
+            if (uniqueValues[j] == samples[i]) {
+                found = true;
+                break;
+            }
+        }
+        if (!found && uniqueCount < 100) {
+            uniqueValues[uniqueCount] = samples[i];
+            uniqueCount++;
+        }
+    }
+
+    // Print first 5 samples
+    Serial.print("First 5 samples: ");
+    for (int i = 0; i < 5; i++) {
+        if (i < sampleCount) {
+            Serial.printf("%d (0x%08X)", samples[i], samples[i]);
+        } else {
+            Serial.print("N/A");
+        }
+        if (i < 4) Serial.print(", ");
+    }
+    Serial.println();
+
+    Serial.printf("Stats: SampleCount=%d, Min=%d, Max=%d, Mean=%.2f, Variance=%.2f, UniqueCount=%d\n",
+                  sampleCount, minVal, maxVal, mean, variance, uniqueCount);
+
+    bool working = false;
+
+    // Diagnostics
+    if (uniqueCount == 1) {
+        if (minVal == 0) {
+            Serial.println("Analysis: STUCK LOW (All zeros. The data line SD is likely tied/shorted to GND, or microphone is unpowered).");
+        } else if (minVal == -2 || minVal == 2147483646 || minVal == -1 || minVal == 2147483647) {
+            Serial.printf("Analysis: STUCK HIGH/CONSTANT (Value: %d / 0x%08X. The data line SD is likely shorted to 3.3V or floating with pull-up enabled).\n", minVal, minVal);
+        } else {
+            Serial.printf("Analysis: STUCK CONSTANT (Value: %d / 0x%08X).\n", minVal, minVal);
+        }
+    } else if (uniqueCount <= 3 && variance < 10.0) {
+        Serial.println("Analysis: STUCK WITH TRIVIAL NOISE (Very low variance, likely floating pin registering minimal power line hum).");
+    } else {
+        Serial.println("Analysis: DYNAMIC ACTIVITY DETECTED (Data line is modulating. This permutation is working!).");
+        working = true;
+    }
+
+    // Clean up
+    i2s_driver_uninstall(I2S_NUM_0);
+    return working;
+}
+
 void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    
+    // LED pin config
+    pinMode(GREEN_LED, OUTPUT);
+    pinMode(YELLOW_LED, OUTPUT);
+    pinMode(RED_LED, OUTPUT);
+    
+    digitalWrite(GREEN_LED, HIGH);
+    delay(100);
+    digitalWrite(GREEN_LED, LOW);
+
+    // SPI setup for LoRa direct register reads
+    pinMode(LORA_SS, OUTPUT);
+    digitalWrite(LORA_SS, HIGH);
+
+    // 1. MPU6050 Startup Detection
+    String mpuDetected = "NO";
+    String mpuAddrStr = "None";
+    String mpuWhoAmIStr = "0x00";
+    
+    Wire.begin(I2C_SDA, I2C_SCL);
+    byte detectedAddr = 0;
+    for (byte addr = 0x68; addr <= 0x69; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            detectedAddr = addr;
+            break;
+        }
+    }
+    if (detectedAddr != 0) {
+        mpuAddrStr = "0x" + String(detectedAddr, HEX);
+        byte who = readMpuWhoAmI(detectedAddr);
+        mpuWhoAmIStr = "0x" + String(who, HEX);
+        
+        mpuAddress = detectedAddr;
+        if (mpu.begin()) {
+            mpuEnabled = true;
+            rawI2CMode = false;
+            mpuDetected = "YES";
+        } else {
+            // Raw register mode for clone
+            Wire.beginTransmission(detectedAddr);
+            Wire.write(0x6B);
+            Wire.write(0x00);
+            Wire.endTransmission();
+            delay(10);
+            
+            rawI2CMode = true;
+            mpuEnabled = true;
+            mpuDetected = "YES";
+        }
+    }
+
+    // 2. LoRa Startup Detection
+    String loraDetected = "NO";
+    String loraVersionStr = "0x00";
+    
+    LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+    int loraBeginResult = LoRa.begin(433E6);
+    byte ver = readRegisterSPI(0x42);
+    loraVersionStr = "0x" + String(ver, HEX);
+    
+    if (loraBeginResult == 1 && ver == 0x12) {
+        loraEnabled = true;
+        loraDetected = "YES";
+    } else if (ver == 0x12) {
+        loraEnabled = true;
+        loraDetected = "YES (SPI active)";
+    } else {
+        loraEnabled = false;
+        loraDetected = "NO";
+    }
+
+    // Print STARTUP DETECTION TABLE
+    Serial.println("\n===== HARDWARE DETECTION =====");
+    Serial.println();
+    Serial.print("MPU6050:\nDetected = "); Serial.println(mpuDetected);
+    Serial.print("Address = "); Serial.println(mpuAddrStr);
+    Serial.print("WHO_AM_I = "); Serial.println(mpuWhoAmIStr);
+    Serial.println();
+    Serial.print("LoRa:\nDetected = "); Serial.println(loraDetected);
+    Serial.print("Version Register = "); Serial.println(loraVersionStr);
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println();
+
+    // 3. MPU6050 High Frequency 20Hz Validation Loop
+    if (mpuEnabled) {
+        Serial.println("\n--- Starting MPU6050 High-Frequency Test (20Hz) ---");
+        Serial.println("Keep the board flat on the table for the first 5 seconds...");
+        Serial.println("Then, rotate the board exactly 90 degrees and hold it still...");
+        delay(2000);
+
+        float minX = 999.0, maxX = -999.0;
+        float minY = 999.0, maxY = -999.0;
+        float minZ = 999.0, maxZ = -999.0;
+        
+        unsigned long start = millis();
+        unsigned long lastRawPrint = 0;
+        int count = 0;
+        
+        while (millis() - start < 15000) {
+            unsigned long now = millis();
+            if (now - lastRawPrint >= 50) { // 20Hz
+                lastRawPrint = now;
+                
+                float ax = 0.0, ay = 0.0, az = 0.0;
+                bool success = false;
+                if (rawI2CMode) {
+                    int16_t raw_ax, raw_ay, raw_az;
+                    if (readRawAcceleration(raw_ax, raw_ay, raw_az)) {
+                        ax = (float)raw_ax / 16384.0 * 9.80665;
+                        ay = (float)raw_ay / 16384.0 * 9.80665;
+                        az = (float)raw_az / 16384.0 * 9.80665;
+                        success = true;
+                    }
+                } else {
+                    sensors_event_t a, g, temp;
+                    mpu.getEvent(&a, &g, &temp);
+                    ax = a.acceleration.x;
+                    ay = a.acceleration.y;
+                    az = a.acceleration.z;
+                    success = true;
+                }
+                
+                if (success) {
+                    if (ax < minX) minX = ax;
+                    if (ax > maxX) maxX = ax;
+                    if (ay < minY) minY = ay;
+                    if (ay > maxY) maxY = ay;
+                    if (az < minZ) minZ = az;
+                    if (az > maxZ) maxZ = az;
+                    
+                    float pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI;
+                    float elapsedSec = (float)(now - start) / 1000.0;
+                    
+                    if (count == 100) {
+                        Serial.println("\n*** NOW ROTATE THE BOARD 90 DEGREES! ***\n");
+                    }
+                    
+                    Serial.printf("[MPU] [%.2fs] Accel X = %.3f, Y = %.3f, Z = %.3f | Tilt = %.3f\n", 
+                                  elapsedSec, ax, ay, az, pitch);
+                    count++;
+                }
+            }
+            delay(5);
+        }
+        
+        Serial.println("\n--- MPU6050 20Hz Test Summary ---");
+        Serial.printf("X range: Min = %.3f, Max = %.3f\n", minX, maxX);
+        Serial.printf("Y range: Min = %.3f, Max = %.3f\n", minY, maxY);
+        Serial.printf("Z range: Min = %.3f, Max = %.3f\n", minZ, maxZ);
+        Serial.println("---------------------------------");
+    }
+
+    // 4. INMP441 Permutation Sweep Test
+    Serial.println("\n=== INMP441 MICROPHONE PERMUTATION SWEEP ===");
+    
+    // Sweep 1: Config A - WS=25, SCK=33, SD=32, Left
+    bool w1 = runI2SStatisticalTest(33, 32, I2S_CHANNEL_FMT_ONLY_LEFT, "WS=25, SCK=33, SD=32 | Channel=LEFT");
+    if (w1) {
+        activeSckPin = 33; activeSdPin = 32; activeChannelFmt = I2S_CHANNEL_FMT_ONLY_LEFT;
+        activeMicConfigName = "WS=25, SCK=33, SD=32 | Left Channel";
+    }
+
+    // Sweep 2: Config B - WS=25, SCK=33, SD=32, Right
+    bool w2 = runI2SStatisticalTest(33, 32, I2S_CHANNEL_FMT_ONLY_RIGHT, "WS=25, SCK=33, SD=32 | Channel=RIGHT");
+    if (w2 && !w1) {
+        activeSckPin = 33; activeSdPin = 32; activeChannelFmt = I2S_CHANNEL_FMT_ONLY_RIGHT;
+        activeMicConfigName = "WS=25, SCK=33, SD=32 | Right Channel";
+    }
+
+    // Sweep 3: Config C - WS=25, SCK=32, SD=33, Left
+    bool w3 = runI2SStatisticalTest(32, 33, I2S_CHANNEL_FMT_ONLY_LEFT, "WS=25, SCK=32, SD=33 | Channel=LEFT");
+    if (w3 && !w1 && !w2) {
+        activeSckPin = 32; activeSdPin = 33; activeChannelFmt = I2S_CHANNEL_FMT_ONLY_LEFT;
+        activeMicConfigName = "WS=25, SCK=32, SD=33 | Left Channel";
+    }
+
+    // Sweep 4: Config D - WS=25, SCK=32, SD=33, Right
+    bool w4 = runI2SStatisticalTest(32, 33, I2S_CHANNEL_FMT_ONLY_RIGHT, "WS=25, SCK=32, SD=33 | Channel=RIGHT");
+    if (w4 && !w1 && !w2 && !w3) {
+        activeSckPin = 32; activeSdPin = 33; activeChannelFmt = I2S_CHANNEL_FMT_ONLY_RIGHT;
+        activeMicConfigName = "WS=25, SCK=32, SD=33 | Right Channel";
+    }
+
+    Serial.println("\n=== SWEEP COMPLETED ===");
+    Serial.printf("Selected Active Mic Config for Loop: %s\n", activeMicConfigName);
+
+    // Initialize the chosen config for the loop
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = activeChannelFmt,
+#ifdef I2S_COMM_FORMAT_STAND_I2S
+        .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_I2S,
+#else
+        .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S_MSB | I2S_COMM_FORMAT_I2S),
+#endif
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 64,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+    };
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = activeSckPin,
+        .ws_io_num = I2S_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = activeSdPin
+    };
+
+    if (i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL) == ESP_OK) {
+        if (i2s_set_pin(I2S_NUM_0, &pin_config) == ESP_OK) {
+            micEnabled = true;
+        }
+    }
+    
+    Serial.println("\nStarting Continuous Diagnostics Loop...");
+}
+
+void loop() {
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint >= 1000) {
+        lastPrint = millis();
+        
+        Serial.println("\n===== DIAGNOSTIC DATA =====");
+        
+        // MPU Diagnostics
+        Serial.println("MPU:");
+        if (mpuEnabled) {
+            byte who = readMpuWhoAmI(mpuAddress);
+            Serial.printf("WHO_AM_I value = 0x%02X\n", who);
+            
+            float ax = 0.0, ay = 0.0, az = 0.0;
+            bool success = false;
+            if (rawI2CMode) {
+                int16_t raw_ax, raw_ay, raw_az;
+                if (readRawAcceleration(raw_ax, raw_ay, raw_az)) {
+                    ax = (float)raw_ax / 16384.0 * 9.80665;
+                    ay = (float)raw_ay / 16384.0 * 9.80665;
+                    az = (float)raw_az / 16384.0 * 9.80665;
+                    success = true;
+                }
+            } else {
+                sensors_event_t a, g, temp;
+                mpu.getEvent(&a, &g, &temp);
+                ax = a.acceleration.x;
+                ay = a.acceleration.y;
+                az = a.acceleration.z;
+                success = true;
+            }
+            if (success) {
+                Serial.printf("Raw Accel X = %.3f, Y = %.3f, Z = %.3f\n", ax, ay, az);
+                float pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI;
+                Serial.printf("Calculated Tilt = %.3f\n", pitch);
+            } else {
+                Serial.println("Raw Accel X = ERROR, Y = ERROR, Z = ERROR");
+                Serial.println("Calculated Tilt = ERROR");
+            }
+        } else {
+            Serial.println("WHO_AM_I value = 0x00");
+            Serial.println("Raw Accel X = 0.000, Y = 0.000, Z = 0.000");
+            Serial.println("Calculated Tilt = 0.000");
+        }
+        
+        // Microphone Diagnostics
+        Serial.printf("\nMicrophone (%s):\n", activeMicConfigName);
+        if (micEnabled) {
+            int32_t samples[64];
+            size_t bytesRead = 0;
+            esp_err_t err = i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, pdMS_TO_TICKS(100));
+            
+            int sampleCount = bytesRead / sizeof(int32_t);
+            double sum = 0.0;
+            int32_t peak = 0;
+            for (int i = 0; i < sampleCount; i++) {
+                int32_t val = samples[i];
+                double val_f = (double)val / 2147483648.0;
+                sum += (val_f * val_f);
+                if (abs(val) > peak) {
+                    peak = abs(val);
+                }
+            }
+            float rms = (sampleCount > 0) ? sqrt(sum / sampleCount) : 0.0;
+            
+            Serial.printf("RMS amplitude = %.6f\n", rms);
+            Serial.print("First 5 samples = ");
+            for (int i = 0; i < 5; i++) {
+                if (i < sampleCount) {
+                    Serial.printf("%d", samples[i]);
+                } else {
+                    Serial.print("0");
+                }
+                if (i < 4) Serial.print(", ");
+            }
+            Serial.println();
+            Serial.printf("Peak amplitude = %d\n", peak);
+        } else {
+            Serial.println("RMS amplitude = 0.000000");
+            Serial.println("First 5 samples = 0, 0, 0, 0, 0");
+            Serial.println("Peak amplitude = 0");
+        }
+        
+        // LoRa Diagnostics
+        Serial.println("\nLoRa:");
+        int beginRes = loraEnabled ? 1 : 0;
+        Serial.printf("LoRa.begin() result = %d (%s)\n", beginRes, beginRes == 1 ? "SUCCESS" : "FAILED");
+        byte loraVer = readRegisterSPI(0x42);
+        Serial.printf("SX1278 version register (0x42) = 0x%02X\n", loraVer);
+        Serial.printf("SPI communication status = %s\n", loraVer == 0x12 ? "OK" : "FAILED");
+        
+        Serial.println("===========================");
+    }
+    delay(10);
+}
+
+#else
+
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+void setup() {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n=============================================");
@@ -223,7 +745,7 @@ void loop() {
         alertActive = true;
         const char* threatType = "INTRUSION";
         if (audioLevel > 50.0 && vibAnom > 30.0) {
-            threatType = "CHAINSAW";
+            threatType = "ACOUSTIC_ANOMALY";
         } else if (tiltAnom > 0.5) {
             threatType = "TREE_FALLING";
         } else if (eco.tamperAlert) {
@@ -236,19 +758,28 @@ void loop() {
     // 5. Update Diagnostic LEDs
     updateLEDs(alertActive);
 
-    // 6. Periodic Telemetry (Every 10 seconds in simulation mode, 60 seconds in normal)
+    // 6. Periodic Telemetry (Every 1 second in DEMO_MODE, otherwise normal)
     static unsigned long lastTelemetry = 0;
     static bool firstTelemetrySent = false;
+#if DEMO_MODE
+    unsigned long telemetryInterval = 1000; // 1 second update
+#else
     unsigned long telemetryInterval = (!loraEnabled || !mpuEnabled || !micEnabled) ? 10000 : 60000;
+#endif
 
     if (!firstTelemetrySent || (millis() - lastTelemetry > telemetryInterval)) {
         sendTelemetry();
         lastTelemetry = millis();
         firstTelemetrySent = true;
 
-        // Deep sleep entry (Bypassed in simulation mode to allow easy USB serial debugging)
+        // Deep sleep entry (Bypassed in demo mode for continuous USB/MQTT tracking)
+#if DEMO_MODE
+        bool runDeepSleep = false;
+#else
+        bool runDeepSleep = true;
+#endif
         bool simulationMode = !loraEnabled || !mpuEnabled || !micEnabled;
-        if (!simulationMode && threatScore < 20.0) {
+        if (runDeepSleep && !simulationMode && threatScore < 20.0) {
             Serial.println("Entering deep sleep (power saving)...");
             digitalWrite(GREEN_LED, LOW);
             digitalWrite(YELLOW_LED, LOW);
@@ -260,6 +791,7 @@ void loop() {
 
     delay(100);
 }
+#endif
 
 void setupLoRa() {
     LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
@@ -443,6 +975,11 @@ float readI2SAudioLevel() {
             simAudio = 85.0; 
             Serial.println("[SIMULATOR] Generating high audio spike...");
         }
+        lastAudioRMS = simAudio * 2.0;
+        lastAudioPeak = simAudio * 30.0;
+        for (int i = 0; i < 5; i++) {
+            lastRawSamples[i] = (int32_t)(simAudio * (rand() % 100000));
+        }
         return simAudio;
     }
 
@@ -456,12 +993,27 @@ float readI2SAudioLevel() {
 
     int sampleCount = bytesRead / sizeof(int32_t);
     double sum = 0.0;
+    int32_t peak = 0;
     for (int i = 0; i < sampleCount; i++) {
         // Convert to normalized floating point (-1.0 to 1.0)
         float val = (float)samples[i] / 2147483648.0;
         sum += (val * val);
+        if (abs(samples[i]) > peak) {
+            peak = abs(samples[i]);
+        }
     }
     float rms = sqrt(sum / sampleCount);
+
+    // Cache values in globals for telemetry
+    lastAudioRMS = rms * 10000.0;
+    lastAudioPeak = peak;
+    for (int i = 0; i < 5; i++) {
+        if (i < sampleCount) {
+            lastRawSamples[i] = samples[i];
+        } else {
+            lastRawSamples[i] = 0;
+        }
+    }
 
     // Scale RMS to 0 - 100 range
     float audioLevel = rms * 2000.0; 
@@ -495,6 +1047,10 @@ float getVibrationAnomaly() {
             simVib = 45.0;
             Serial.println("[SIMULATOR] Generating vibration shockwave...");
         }
+        lastAccelX = 0.0;
+        lastAccelY = 0.0;
+        lastAccelZ = 9.81;
+        lastVibrationScore = simVib;
         return simVib;
     }
 
@@ -530,6 +1086,13 @@ float getVibrationAnomaly() {
     // Map deviation to a vibration anomaly score (0-100)
     float score = deviation * 15.0;
     if (score > 100.0) score = 100.0;
+
+    // Cache values in globals for telemetry
+    lastAccelX = ax;
+    lastAccelY = ay;
+    lastAccelZ = az;
+    lastVibrationScore = score;
+
     return score;
 }
 
@@ -620,12 +1183,30 @@ void sendAlert(float score, const char* type) {
 }
 
 void sendTelemetry() {
-    StaticJsonDocument<250> doc;
+    StaticJsonDocument<512> doc;
     doc["id"] = NODE_ID;
-    doc["bsi"] = eco.bioacousticRichness;
-    doc["noise_floor"] = backgroundNoiseFloor;
-    doc["threshold"] = eco.adaptiveThreshold;
     doc["tilt"] = currentTilt;
+    doc["accel_x"] = lastAccelX;
+    doc["accel_y"] = lastAccelY;
+    doc["accel_z"] = lastAccelZ;
+    doc["vib"] = lastVibrationScore;
+    doc["rms"] = lastAudioRMS;
+    doc["peak"] = lastAudioPeak;
+    doc["uptime"] = millis();
+
+    // LoRa info
+    doc["rssi"] = loraEnabled ? LoRa.packetRssi() : -120;
+    doc["packets"] = loraPacketCount;
+    doc["lora_ver"] = loraEnabled ? readRegisterSPI(0x42) : 0;
+
+    // Statuses
+    doc["mpu_status"] = mpuEnabled ? "ONLINE" : "OFFLINE";
+    doc["mic_status"] = micEnabled ? "ONLINE" : "OFFLINE";
+    doc["lora_status"] = loraEnabled ? "ONLINE" : "OFFLINE";
+    doc["esp_status"] = "ONLINE";
+
+    // Diagnostics
+    doc["who_am_i"] = mpuEnabled ? readMpuWhoAmI(mpuAddress) : 0;
 
     float temperature = 28.5;
     float humidity = 65.0;
@@ -639,11 +1220,15 @@ void sendTelemetry() {
 
     // Real battery sense on pin 35 (safe ADC)
     float raw = analogRead(BATTERY_PIN);
-    // 1:1 voltage divider (e.g. 10k/10k) means voltage = raw_adc_volts * 2
     float voltage = (raw / 4095.0) * 3.3 * 2.0; 
     doc["batt"] = voltage;
     doc["batt_pct"] = map(voltage * 100, 330, 420, 0, 100);
-    doc["uptime"] = millis();
+
+    // Add raw samples
+    JsonArray rawArr = doc.createNestedArray("raw_samples");
+    for (int i = 0; i < 5; i++) {
+        rawArr.add(lastRawSamples[i]);
+    }
 
     String output;
     serializeJson(doc, output);
@@ -661,6 +1246,7 @@ void sendTelemetry() {
         LoRa.beginPacket();
         LoRa.print(output);
         LoRa.endPacket();
+        loraPacketCount++;
         Serial.println("Telemetry Sent via LoRa: " + output);
     } else {
         Serial.println("Telemetry Sent via Serial: " + output);
@@ -721,4 +1307,28 @@ void updateLEDs(bool alertActive) {
     } else {
         digitalWrite(RED_LED, LOW);
     }
+}
+
+// Implement direct sensor register readers for use in normal mode telemetry
+byte readRegisterSPI(byte address) {
+    SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(LORA_SS, LOW);
+    SPI.transfer(address & 0x7F);
+    byte value = SPI.transfer(0x00);
+    digitalWrite(LORA_SS, HIGH);
+    SPI.endTransaction();
+    return value;
+}
+
+byte readMpuWhoAmI(byte addr) {
+    byte chipID = 0;
+    Wire.beginTransmission(addr);
+    Wire.write(0x75);
+    if (Wire.endTransmission(false) == 0) {
+        Wire.requestFrom(addr, (uint8_t)1);
+        if (Wire.available()) {
+            chipID = Wire.read();
+        }
+    }
+    return chipID;
 }
