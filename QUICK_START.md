@@ -1,98 +1,150 @@
 # VanRakshak-X — Quick Start Guide
 
-> Deploy your forest sentinel network in under 60 seconds.
+> Deploy your forest sentinel network in under 60 seconds on **macOS** or **Windows**.
 
 ---
 
-## Prerequisites (One-Time Setup)
+## Table of Contents
 
-Before your first launch, run the installer **once**:
-
-```
-Double-click  install.bat
-```
-
-The installer will:
-- Create the Python virtual environment in `backend/.venv`
-- Install all Python packages (`fastapi`, `pyserial`, `paho-mqtt`, etc.)
-- Install all Next.js dashboard packages
-- Check that Mosquitto MQTT and Node.js are present
-- Generate the `backend/.env` configuration file
-
-> **Required software** (install if not present):
-> - [Python 3.8+](https://www.python.org/downloads/) — check **Add Python to PATH** during install
-> - [Node.js v18+](https://nodejs.org/)
-> - [Mosquitto MQTT](https://mosquitto.org/download/) — install as a Windows Service
+- [Prerequisites](#prerequisites)
+- [macOS — Install & Launch](#macos--install--launch)
+- [Windows — Install & Launch](#windows--install--launch)
+- [Demo Mode (No Hardware)](#demo-mode-no-hardware)
+- [Startup Checklist Explained](#startup-checklist-explained)
+- [Health API](#health-api)
+- [Stopping the System](#stopping-the-system)
+- [Troubleshooting](#troubleshooting)
+- [System Architecture](#system-architecture)
 
 ---
 
-## One-Click Launch
+## Prerequisites
 
-**Step 1** — Plug your ESP32 into USB.
+Install these once, before running the installer:
 
-**Step 2** — Double-click:
-```
-start_vanrakshak.bat
-```
-
-**Step 3** — The dashboard opens automatically at:
-```
-http://localhost:3000
-```
-
-That's it. No terminal commands needed.
+| Software | macOS | Windows |
+|----------|-------|---------|
+| **Python 3.8+** | `brew install python` or [python.org](https://www.python.org/downloads/) | [python.org](https://www.python.org/downloads/) — check **Add Python to PATH** |
+| **Node.js v18+** | `brew install node` or [nodejs.org](https://nodejs.org/) | [nodejs.org](https://nodejs.org/) |
+| **Mosquitto MQTT** | `brew install mosquitto` | [mosquitto.org/download](https://mosquitto.org/download/) — install as Windows Service |
 
 ---
 
-## What the Startup Checklist Means
+## macOS — Install & Launch
 
-When the launcher runs, it prints a checklist like this:
+### Step 1 — Install dependencies (one-time only)
 
-```
-==================================================
-             SYSTEM STARTUP CHECKLIST
-==================================================
-[OK] ESP32 Connected (on COM5)
-[OK] MQTT Running
-[OK] Database Connected
-[OK] WebSocket Active
-[OK] Dashboard Ready
-==================================================
+Open **Terminal** and run:
+
+```bash
+bash install.sh
 ```
 
-| Item             | ONLINE means…                                      |
-|------------------|----------------------------------------------------|
-| ESP32 Connected  | A valid telemetry packet was received from the node |
-| MQTT Running     | Mosquitto broker is listening on port 1883          |
-| Database Connected | SQLite database is readable and writable           |
-| WebSocket Active | FastAPI WebSocket `/ws` endpoint is ready           |
-| Dashboard Ready  | Next.js dev server is listening on port 3000        |
+The script will:
+- Verify Python 3.8+ and Node.js are installed
+- Create a Python virtual environment in `backend/.venv`
+- Install all Python packages
+- Install all npm packages
+- Check for Mosquitto
+- Generate `backend/.env`
+- Mark `start_vanrakshak.sh` as executable
+
+### Step 2 — Plug in your ESP32
+
+Connect the ESP32 board via USB. macOS will assign it a port such as:
+- `/dev/cu.usbserial-XXXX`
+- `/dev/cu.SLAB_USBtoUART`
+- `/dev/cu.wchusbserial-XXXX`
+
+The launcher detects it automatically — no configuration needed.
+
+### Step 3 — Launch the system
+
+```bash
+bash start_vanrakshak.sh
+```
+
+Or double-click `start_vanrakshak.sh` in Finder (requires Terminal to be set as the default app for `.sh` files).
+
+The dashboard opens automatically at **http://localhost:3000**.
+
+---
+
+## Windows — Install & Launch
+
+### Step 1 — Install dependencies (one-time only)
+
+Double-click **`install.bat`**.
+
+The script will:
+- Verify Python 3.8+ is installed and in PATH
+- Create a Python virtual environment in `backend\.venv`
+- Install all Python packages
+- Install all npm packages
+- Check for Mosquitto
+- Generate `backend\.env`
+
+### Step 2 — Plug in your ESP32
+
+Connect the ESP32 board via USB. Windows will assign it a COM port such as `COM3`, `COM5`, etc.
+The launcher detects it automatically.
+
+### Step 3 — Launch the system
+
+Double-click **`start_vanrakshak.bat`**.
+
+The dashboard opens automatically at **http://localhost:3000**.
 
 ---
 
 ## Demo Mode (No Hardware)
 
-If no ESP32 is connected, the launcher will ask:
+If no ESP32 is connected, the launcher asks:
 
 ```
 ESP32 Not Found
 Run Demo Mode? [Y/n]:
 ```
 
-Press **Enter** (or type `Y`) to run in simulated Demo Mode.  
-The dashboard will show realistic simulated telemetry data.
+Press **Enter** (or type `Y`) to start in simulated Demo Mode.
+The dashboard will show realistic simulated telemetry — all charts and panels fully functional.
+
+---
+
+## Startup Checklist Explained
+
+After services spin up, the launcher prints:
+
+```
+==================================================
+             SYSTEM STARTUP CHECKLIST
+==================================================
+✅ ESP32 Connected (on /dev/cu.usbserial-0001)   ← or [OK] on Windows CMD
+✅ MQTT Running
+✅ Database Connected
+✅ WebSocket Active
+✅ Dashboard Ready
+==================================================
+```
+
+| Item | ONLINE means… |
+|------|--------------|
+| **ESP32 Connected** | A valid JSON telemetry packet received from the node within 6 s of probing |
+| **MQTT Running** | Mosquitto broker is listening on port 1883 |
+| **Database Connected** | SQLite database is readable and writable |
+| **WebSocket Active** | FastAPI `/ws` endpoint responded to the health check |
+| **Dashboard Ready** | Next.js dev server is listening on port 3000 |
 
 ---
 
 ## Health API
 
-The backend exposes a health check endpoint you can call at any time:
+Query the system health at any time:
 
 ```
 GET http://localhost:8000/health
 ```
 
-Example response:
 ```json
 {
   "esp32": true,
@@ -103,15 +155,15 @@ Example response:
 }
 ```
 
-`websocket` is `true` only when a browser tab has the dashboard open.
+> `websocket` is `true` only when a browser tab has the dashboard open.
 
 ---
 
 ## Stopping the System
 
-Press **Ctrl+C** in the launcher window.
+Press **Ctrl+C** in the launcher terminal window.
 
-The launcher will gracefully stop:
+The launcher gracefully stops all components:
 1. Serial Bridge
 2. FastAPI Backend
 3. Next.js Dashboard
@@ -120,14 +172,27 @@ The launcher will gracefully stop:
 
 ## Troubleshooting
 
+### macOS
+
 | Problem | Solution |
 |---------|----------|
-| `ESP32 Not Found` | Check USB cable and COM port assignment in Device Manager |
-| `MQTT Offline` | Start Mosquitto: `net start mosquitto` or install from mosquitto.org |
-| `Dashboard Offline` | Wait 15–20 seconds for Next.js to compile, then refresh the browser |
-| `Database Offline` | Delete `backend/vanrakshak.db` and restart — it will be recreated |
-| `[ERROR] Python not found` | Re-run `install.bat` after installing Python 3.8+ with PATH enabled |
-| Dashboard shows "Establishing Hardware Neural Link..." forever | Backend is not running — check the launcher window for errors |
+| `ESP32 Not Found` | Run `ls /dev/cu.*` — if the port is present but not detected, ensure the CP2102/CH340 USB driver is installed |
+| `MQTT Offline` | Run `brew services start mosquitto` manually, then retry |
+| `Permission denied` on `/dev/cu.*` | Run `sudo chmod 666 /dev/cu.usbserial-XXXX` |
+| `bash: start_vanrakshak.sh: Permission denied` | Run `chmod +x start_vanrakshak.sh` |
+| Dashboard shows "Establishing Hardware Neural Link..." forever | Backend is not running — check the terminal for errors |
+| `command not found: brew` | Install Homebrew from [brew.sh](https://brew.sh) |
+
+### Windows
+
+| Problem | Solution |
+|---------|----------|
+| `ESP32 Not Found` | Check Device Manager → Ports (COM & LPT) for the COM port number |
+| `MQTT Offline` | Run `net start mosquitto` in an Administrator terminal |
+| `[ERROR] Python not found` | Reinstall Python and check **Add Python to PATH** |
+| `Dashboard Offline` | Wait 20 s for Next.js to compile, then refresh the browser |
+| `Database Offline` | Delete `backend\vanrakshak.db` and restart — it will be recreated |
+| `Access is denied` on COM port | Another application (e.g. Arduino IDE) is using the port — close it first |
 
 ---
 
@@ -135,21 +200,32 @@ The launcher will gracefully stop:
 
 ```
 ESP32 Sensor Node
-    │ USB Serial (115200 baud)
+    │  USB Serial (115200 baud)
+    │  macOS: /dev/cu.usbserial-*
+    │  Windows: COM3, COM5, …
     ▼
-serial_bridge.py  ──▶  MQTT Broker (Mosquitto :1883)
-                              │
-                              ▼
+serial_bridge.py  ──▶  Mosquitto MQTT Broker (:1883)
+                                │
+                                ▼
                     FastAPI Backend (:8000)
-                    ├── /health  (REST)
-                    ├── /nodes   (REST)
-                    ├── /alerts  (REST)
-                    └── /ws      (WebSocket)
-                              │
-                              ▼
+                    ├── GET  /health
+                    ├── GET  /nodes
+                    ├── GET  /alerts
+                    └── WS   /ws
+                                │
+                                ▼
                     Next.js Dashboard (:3000)
 ```
 
+### One-click entry points
+
+| OS | Installer | Launcher |
+|----|-----------|----------|
+| macOS | `bash install.sh` | `bash start_vanrakshak.sh` |
+| Windows | `install.bat` (double-click) | `start_vanrakshak.bat` (double-click) |
+
+Both call the same `launcher.py` which auto-detects the platform at runtime.
+
 ---
 
-*VanRakshak-X v1.0 MVP — Forest Defense Infrastructure*
+*VanRakshak-X v2 — Forest Defense Infrastructure*
