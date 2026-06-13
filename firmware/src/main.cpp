@@ -346,11 +346,14 @@ void setupMPU() {
     pinMode(PIR_PIN, INPUT);
 }
 
-bool setupI2S() {
+bool tryI2SPins(int sckPin, int sdPin) {
+    // Uninstall if already installed to ensure clean state
+    i2s_driver_uninstall(I2S_NUM_0);
+
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = 16000,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // INMP441 reads as 32-bit (24 bits data)
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
 #ifdef I2S_COMM_FORMAT_STAND_I2S
         .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_I2S,
@@ -366,27 +369,35 @@ bool setupI2S() {
     };
 
     i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_SCK,
+        .bck_io_num = sckPin,
         .ws_io_num = I2S_WS,
         .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_SD
+        .data_in_num = sdPin
     };
 
     if (i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL) != ESP_OK) {
-        Serial.println("[HARDWARE] I2S Driver Installation Failed.");
         return false;
     }
 
     if (i2s_set_pin(I2S_NUM_0, &pin_config) != ESP_OK) {
-        Serial.println("[HARDWARE] I2S Pin Configuration Failed.");
         return false;
     }
 
-    // Verify physical microphone connection by reading a test block of samples
+    // Give microphone time to boot and clocks to settle
+    delay(200);
+
+    // Read and discard a few blocks to clear startup transients
+    int32_t discardSamples[64];
+    size_t discardBytes = 0;
+    for (int k = 0; k < 6; k++) {
+        i2s_read(I2S_NUM_0, discardSamples, sizeof(discardSamples), &discardBytes, pdMS_TO_TICKS(50));
+    }
+
+    // Verify samples
     int32_t testSamples[64];
     size_t testBytes = 0;
     esp_err_t err = i2s_read(I2S_NUM_0, testSamples, sizeof(testSamples), &testBytes, pdMS_TO_TICKS(100));
-    
+
     bool flatline = true;
     if (err == ESP_OK && testBytes > 0) {
         int sampleCount = testBytes / sizeof(int32_t);
@@ -397,14 +408,28 @@ bool setupI2S() {
             }
         }
     }
-    
-    if (flatline) {
-        Serial.println("[HARDWARE] INMP441 Microphone (I2S) flatlined/not connected. Disabling.");
-        return false;
-    }
+    return !flatline;
+}
 
-    Serial.println("[HARDWARE] INMP441 Microphone (I2S) Initialized successfully.");
-    return true;
+bool setupI2S() {
+    Serial.println("[HARDWARE] Initializing INMP441 Microphone (I2S)...");
+    
+    // Try primary configuration (SCK=33, SD=32)
+    if (tryI2SPins(33, 32)) {
+        Serial.println("[HARDWARE] INMP441 Microphone (I2S) Initialized successfully on primary pins (SCK=33, SD=32).");
+        return true;
+    }
+    
+    // Try secondary configuration (SCK=32, SD=33)
+    Serial.println("[HARDWARE] INMP441 flatlined on primary pins. Trying swapped pins (SCK=32, SD=33)...");
+    if (tryI2SPins(32, 33)) {
+        Serial.println("[HARDWARE] INMP441 Microphone (I2S) Initialized successfully on swapped pins (SCK=32, SD=33).");
+        return true;
+    }
+    
+    Serial.println("[HARDWARE] INMP441 Microphone (I2S) failed flatline check on both pin configurations. Disabling microphone.");
+    i2s_driver_uninstall(I2S_NUM_0); // Clean up if installed but failed
+    return false;
 }
 
 float readI2SAudioLevel() {
