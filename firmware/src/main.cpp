@@ -5,6 +5,22 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <driver/i2s.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// WiFi & MQTT Credentials
+const char* ssid = "irladitya";
+const char* password = "00000000";
+const char* mqttServer = "192.168.1.5";
+const int mqttPort = 1883;
+#define USE_WIFI false // Set to true if you have a stable power supply (e.g. decoupling capacitor) to connect to WiFi
+
+#if USE_WIFI
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+#endif
+
+
 
 // Pin Definitions for Standard ESP32 (WROOM)
 #define LORA_SCK 18
@@ -82,7 +98,11 @@ public:
         // Novelty #2: Ecological Silence Detection
         // If sound drops significantly below noise floor, it indicates wildlife flight
         if (backgroundNoiseFloor > 5.0 && currentAudioLevel < (backgroundNoiseFloor * 0.3)) {
-            Serial.println("ALERT: Ecological Silence Detected! Potential Human Presence (Birds flight).");
+            static unsigned long lastSilenceAlert = 0;
+            if (millis() - lastSilenceAlert > 10000) { // Limit to once every 10 seconds
+                Serial.println("ALERT: Ecological Silence Detected! Potential Human Presence (Birds flight).");
+                lastSilenceAlert = millis();
+            }
             bioacousticRichness = 20.0; // Richness drops
         } else {
             bioacousticRichness = 90.0; // Normal state
@@ -108,6 +128,8 @@ Adafruit_MPU6050 mpu;
 void setupLoRa();
 void setupMPU();
 bool setupI2S();
+void setupWiFi();
+void reconnectMQTT();
 float readI2SAudioLevel();
 float getVibrationAnomaly();
 float getTiltAnomaly();
@@ -144,6 +166,12 @@ void setup() {
     micEnabled = setupI2S();
     ai.setup();
 
+#if USE_WIFI
+    // Setup WiFi & MQTT Configuration
+    setupWiFi();
+    mqttClient.setServer(mqttServer, mqttPort);
+#endif
+
     // Check if we are running in Simulation Mode
     bool simulationMode = !loraEnabled || !mpuEnabled || !micEnabled;
     if (simulationMode) {
@@ -166,6 +194,16 @@ void setup() {
 }
 
 void loop() {
+#if USE_WIFI
+    // Keep WiFi and MQTT connection active
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!mqttClient.connected()) {
+            reconnectMQTT();
+        }
+        mqttClient.loop();
+    }
+#endif
+
     // 1. Audio Analysis & Baseline Update
     float audioLevel = readI2SAudioLevel();
     eco.updateBaseline(audioLevel);
@@ -200,11 +238,13 @@ void loop() {
 
     // 6. Periodic Telemetry (Every 10 seconds in simulation mode, 60 seconds in normal)
     static unsigned long lastTelemetry = 0;
+    static bool firstTelemetrySent = false;
     unsigned long telemetryInterval = (!loraEnabled || !mpuEnabled || !micEnabled) ? 10000 : 60000;
 
-    if (millis() - lastTelemetry > telemetryInterval) {
+    if (!firstTelemetrySent || (millis() - lastTelemetry > telemetryInterval)) {
         sendTelemetry();
         lastTelemetry = millis();
+        firstTelemetrySent = true;
 
         // Deep sleep entry (Bypassed in simulation mode to allow easy USB serial debugging)
         bool simulationMode = !loraEnabled || !mpuEnabled || !micEnabled;
@@ -535,6 +575,15 @@ void sendAlert(float score, const char* type) {
     String output;
     serializeJson(doc, output);
 
+    // Send via WiFi MQTT if connected
+#if USE_WIFI
+    if (mqttClient.connected()) {
+        String topic = "vanrakshak/node/" + String(NODE_ID) + "/alert";
+        mqttClient.publish(topic.c_str(), output.c_str());
+        Serial.println("Alert Sent via WiFi MQTT: " + output);
+    }
+#endif
+
     if (loraEnabled) {
         LoRa.beginPacket();
         LoRa.print(output);
@@ -574,6 +623,15 @@ void sendTelemetry() {
     String output;
     serializeJson(doc, output);
 
+    // Send via WiFi MQTT if connected
+#if USE_WIFI
+    if (mqttClient.connected()) {
+        String topic = "vanrakshak/node/" + String(NODE_ID) + "/telemetry";
+        mqttClient.publish(topic.c_str(), output.c_str());
+        Serial.println("Telemetry Sent via WiFi MQTT: " + output);
+    }
+#endif
+
     if (loraEnabled) {
         LoRa.beginPacket();
         LoRa.print(output);
@@ -583,6 +641,42 @@ void sendTelemetry() {
         Serial.println("Telemetry Sent via Serial: " + output);
     }
 }
+
+#if USE_WIFI
+void setupWiFi() {
+    Serial.print("\nConnecting to WiFi SSID: ");
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 15) {
+        delay(500);
+        Serial.print(".");
+        retries++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n[HARDWARE] WiFi Connected successfully.");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\n[HARDWARE] WiFi Connection Failed (Timeout).");
+    }
+}
+
+void reconnectMQTT() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    static unsigned long lastReconnectAttempt = 0;
+    if (millis() - lastReconnectAttempt > 5000) {
+        lastReconnectAttempt = millis();
+        Serial.println("[MQTT] Attempting connection to PC MQTT broker...");
+        if (mqttClient.connect(NODE_ID)) {
+            Serial.println("[MQTT] Connected to PC broker successfully!");
+        } else {
+            Serial.print("[MQTT] Connection failed, rc=");
+            Serial.println(mqttClient.state());
+        }
+    }
+}
+#endif
 
 void updateLEDs(bool alertActive) {
     // Green LED indicates normal running / system active
