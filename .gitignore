@@ -1,0 +1,26 @@
+# PlatformIO (anywhere in project)
+**/.pio/
+**/.platformio/
+
+# Python (anywhere in project)
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/vanrakshak.db
+**/vanrakshak.db-journal
+
+# Node / Next.js / Presentation (anywhere in project)
+**/node_modules/
+**/.next/
+**/*.tsbuildinfo
+**/out/
+**/dist/
+
+# Environment files
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Operating System Files
+.DS_Store
+Thumbs.db
